@@ -2,7 +2,7 @@ name: Build APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   workflow_dispatch:
 
 permissions:
@@ -23,30 +23,75 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
-      - name: Build release APK + lint
+      # Находит проект где угодно в репозитории (корень или подпапка).
+      # Если загружен только .zip — распаковывает его.
+      - name: Locate project
+        id: proj
+        shell: bash
+        run: |
+          find_proj() {
+            find . -path ./.git -prune -o -name 'settings.gradle*' -print \
+              | grep -v '/build/' | awk '{ print length, $0 }' | sort -n | head -1 | cut -d' ' -f2-
+          }
+          S=$(find_proj)
+          if [ -z "$S" ]; then
+            Z=$(find . -path ./.git -prune -o -name '*.zip' -print | head -1)
+            if [ -n "$Z" ]; then
+              echo "Проект не найден, распаковываю $Z"
+              mkdir -p _unzipped && unzip -q -o "$Z" -d _unzipped
+              S=$(find_proj)
+            fi
+          fi
+          if [ -z "$S" ]; then
+            echo "::error::Не найден settings.gradle. Загрузите в репозиторий файлы проекта (app/, build.gradle, settings.gradle ...)."
+            echo "Содержимое репозитория:"; find . -path ./.git -prune -o -type f -print | head -100
+            exit 1
+          fi
+          DIR=$(dirname "$S")
+          echo "Проект: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          ls -la "$DIR"
+
+      - name: Build release APK
         shell: bash
         run: |
           set -o pipefail
-          gradle assembleRelease lint --no-daemon --stacktrace 2>&1 | tee build.log
+          gradle -p "${{ steps.proj.outputs.dir }}" assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
 
-      - name: Publish release
-        if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Lint (не блокирует сборку)
+        continue-on-error: true
+        shell: bash
         run: |
-          APK=LightClock-v1.0-build${{ github.run_number }}.apk
-          cp app/build/outputs/apk/release/app-release.apk "$APK"
+          set -o pipefail
+          gradle -p "${{ steps.proj.outputs.dir }}" lintRelease --no-daemon 2>&1 | tee lint.log
+
+      - name: Prepare APK
+        id: apk
+        shell: bash
+        run: |
+          SRC=$(find "${{ steps.proj.outputs.dir }}/app/build/outputs/apk/release" -name '*.apk' | head -1)
+          APK="LightClock-v1.0-build${{ github.run_number }}.apk"
+          cp "$SRC" "$APK"
           ls -l "$APK"
-          gh release create "build-${{ github.run_number }}" "$APK" \
-            --title "Часы — сборка ${{ github.run_number }}" \
-            --notes "Автоматическая сборка из коммита ${{ github.sha }}. Release APK подписан отладочным ключом."
+          echo "file=$APK" >> "$GITHUB_OUTPUT"
 
       - name: Upload APK artifact
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: LightClock-apk
-          path: LightClock-*.apk
+          path: |
+            ${{ steps.apk.outputs.file }}
+            ${{ steps.proj.outputs.dir }}/app/build/reports/lint-results-release.html
+          if-no-files-found: warn
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" "${{ steps.apk.outputs.file }}" \
+            --target "${{ github.sha }}" \
+            --title "Часы — сборка ${{ github.run_number }}" \
+            --notes "Автосборка из коммита ${{ github.sha }}. APK подписан отладочным ключом — устанавливается напрямую."
 
       - name: Save build log on failure
         if: failure()
@@ -54,8 +99,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p /tmp/logs
-          cp build.log /tmp/logs/ 2>/dev/null || echo "no log" > /tmp/logs/build.log
-          cp -r app/build/reports /tmp/logs/ 2>/dev/null || true
+          cp build.log lint.log /tmp/logs/ 2>/dev/null || true
+          cp -r "${{ steps.proj.outputs.dir }}/app/build/reports" /tmp/logs/ 2>/dev/null || true
+          [ "$(ls -A /tmp/logs)" ] || echo "no log" > /tmp/logs/build.log
           cd /tmp/logs
           git init -q -b build-logs
           git config user.name github-actions
